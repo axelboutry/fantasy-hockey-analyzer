@@ -264,6 +264,13 @@ def load_overrides():
                     if isinstance(v, str):
                         v = v.replace("Let's Do That Hockey", "Let’s Do That Hockey")
                         v = v.replace("Seeing Ghosts", "Return of the Mac")
+                    
+                    # Force correct unique identifiers for legacy saves
+                    if k == "elias pettersson":
+                        k = "elias pettersson (f)"
+                    elif k == "sebastian aho":
+                        k = "sebastian aho (f)"
+                        
                     normalized[k] = v
                 return normalized
         except Exception:
@@ -384,11 +391,8 @@ def fetch_base_teams_and_positions():
                             }
         except Exception:
             pass
-        if base_info:
-            break
-    return base_info    
+    return base_info   
 
-# --- BULLETPROOF RAW TEXT SCRAPER ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_injury_text_dump():
     combined_text = ""
@@ -397,7 +401,6 @@ def fetch_injury_text_dump():
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
     }
     
-    # Hit multiple sources to guarantee we don't miss hidden LTIR players
     urls = [
         "https://www.cbssports.com/nhl/injuries/",
         "https://www.espn.com/nhl/injuries",
@@ -407,12 +410,9 @@ def fetch_injury_text_dump():
     for url in urls:
         try:
             resp = requests.get(url, headers=headers, timeout=10)
-            # Rip out all code logic and styling
             html = re.sub(r'<script.*?</script>', ' ', resp.text, flags=re.DOTALL | re.IGNORECASE)
             html = re.sub(r'<style.*?</style>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
-            # Strip remaining HTML brackets to leave pure raw text
             text = re.sub(r'<[^>]+>', ' ', html)
-            # Compress extra spaces and lowercase everything
             text = re.sub(r'\s+', ' ', text).lower()
             combined_text += text + " "
         except Exception:
@@ -432,7 +432,6 @@ def get_injury_tag(clean_name, combined_text):
     last_name = parts[-1]
     first_init = first_name[0]
     
-    # Create different spelling combinations to catch Yahoo vs ESPN typos (Aleksander vs Alexander)
     name_variants = [
         f"{first_name} {last_name}",
         f"{first_init}. {last_name}",
@@ -443,16 +442,13 @@ def get_injury_tag(clean_name, combined_text):
         name_variants.append(f"alexander {last_name}")
         name_variants.append(f"barkov, alexander")
         
-    # Search the massive wall of text for the player's name
     for variant in name_variants:
         matches = [m.start() for m in re.finditer(re.escape(variant), combined_text)]
         for match_idx in matches:
-            # If the name is found, grab the 120 characters immediately surrounding it
             start = max(0, match_idx - 60)
             end = min(len(combined_text), match_idx + 120)
             window = combined_text[start:end]
             
-            # If any injury keyword appears in that same window, tag them
             if bool(re.search(r'\b(out|ir|injured reserve|ltir|ir-lt|ir-nr|non-roster)\b', window)):
                 return "🚨 OUT"
             if bool(re.search(r'\b(day-to-day|dtd|day to day)\b', window)):
@@ -460,6 +456,36 @@ def get_injury_tag(clean_name, combined_text):
             
     return ""
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_weekly_schedule_counts(start_date_str, end_date_str):
+    start_d = datetime.datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end_d = datetime.datetime.strptime(end_date_str, "%Y-%m-%d").date()
+    
+    team_game_counts = {}
+    daily_counts = {}
+    
+    current_d = start_d
+    while current_d <= end_d:
+        url = f"https://api-web.nhle.com/v1/schedule/{current_d.strftime('%Y-%m-%d')}"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for day in data.get("gameWeek", []):
+                    day_date = datetime.datetime.strptime(day["date"], "%Y-%m-%d").date()
+                    if start_d <= day_date <= end_d and day_date not in daily_counts:
+                        games = day.get("games", [])
+                        daily_counts[day_date] = len(games)
+                        for game in games:
+                            away = game.get("awayTeam", {}).get("abbrev", "FA")
+                            home = game.get("homeTeam", {}).get("abbrev", "FA")
+                            team_game_counts[away] = team_game_counts.get(away, 0) + 1
+                            team_game_counts[home] = team_game_counts.get(home, 0) + 1
+        except Exception:
+            pass
+        current_d += datetime.timedelta(days=7) 
+        
+    return team_game_counts, daily_counts
 
 def inject_missing_draft_players(df, is_goalie=False):
     if df.empty: 
@@ -694,15 +720,23 @@ app_mode = st.sidebar.radio(
     options=[
         "📊 League & Waiver Hub",
         "🤝 Trade & Transaction Hub",
-        "📐 Math & Formula Inspector",
-        "📰 Weekly Gazette / League Journal",
-        "🔮 Oracle Projections (Beat the Val Model)",
+        "📰 League Gazette & The Oracle",
     ],
 )
 
 # --- DATA SETTINGS IN SIDEBAR ---
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Data & Season Settings")
+
+with st.sidebar.expander("📐 How the Tiered Grading & Math Works"):
+    st.markdown("""
+    **Skater Scale (1.0 to 7.0):** Evaluated across 7 categories (G, A, PPP, +/-, S, Hits, BkS) mapped to 1-10 tier thresholds with an 82-game pace ceiling. Dual-eligibility awards +0.20 per extra position.
+    
+    **Goalie Scale (1.0 to 4.0):** Evaluated across 4 categories (W, GAA, SV%, SO). GAA is calculated inversely.
+    
+    **Multi-Season Weighting:** 80% (2025-26) / 50% (2024-25) / 20% (2023-24) divided by 1.5.
+    """)
+
 view_mode = st.sidebar.radio("View Scope", options=["This Season (2026-27)", "Single Season", "Multi-Season Combined (80/50/20)"])
 
 selected_mode = None
@@ -882,6 +916,18 @@ WEEKLY_SCHEDULE = {
 if app_mode == "📊 League & Waiver Hub":
     st.title("📊 League & Waiver Hub")
     st.markdown("View all rosters, filter free agents, and examine draft outcomes.")
+    
+    # Determine the current week for schedule fetching
+    today_date = datetime.date.today()
+    current_week_info = WEEKLY_SCHEDULE["Week 1"]
+    for w, info in WEEKLY_SCHEDULE.items():
+        s_d = datetime.datetime.strptime(info["start"], "%Y-%m-%d").date()
+        e_d = datetime.datetime.strptime(info["end"], "%Y-%m-%d").date()
+        if s_d <= today_date <= e_d:
+            current_week_info = info
+            break
+            
+    team_games, _ = fetch_weekly_schedule_counts(current_week_info["start"], current_week_info["end"])
 
     tab1, tab2 = st.tabs(["📋 Roster & Waiver Pool", "📋 Draft Analysis"])
 
@@ -904,10 +950,16 @@ if app_mode == "📊 League & Waiver Hub":
         if active_pool.empty:
             st.info(f"No {'goalie' + ('s' if not show_goalies_toggle else '')} data available for {selected_mode}.")
         else:
+            active_pool["GP This Wk"] = active_pool["Team"].apply(lambda x: team_games.get(x, 0))
+            prioritize_streamers = False
+            
             if pool_choice == "My Team ('Let’s Do That Hockey')":
                 active_pool = active_pool[active_pool["Fantasy_Team"].str.contains(r"Let[’']s Do That Hockey", case=False, na=False, regex=True)]
             elif pool_choice == "Waiver Wire / Free Agent":
                 active_pool = active_pool[active_pool["Fantasy_Team"] == "Waiver Wire / Free Agent"]
+                prioritize_streamers = st.checkbox("⚡ Prioritize Streamers (3+ Games This Week)")
+                if prioritize_streamers:
+                    active_pool = active_pool[active_pool["GP This Wk"] >= 3]
             elif pool_choice.startswith("Opponent: "):
                 target_opp = pool_choice.replace("Opponent: ", "").strip()
                 safe_opp = target_opp.replace("'", ".").replace("’", ".")
@@ -915,22 +967,24 @@ if app_mode == "📊 League & Waiver Hub":
 
             avg_gp = active_pool["GP"].mean() if "GP" in active_pool.columns and active_pool["GP"].mean() > 0 else 1.0
             pace_mult = (82.0 / avg_gp) if (apply_82_pace and avg_gp < 82) else 1.0
+            sort_cols = ["GP This Wk", "Overall_Rating"] if prioritize_streamers else ["Overall_Rating"]
+            sort_asc = [False, False] if prioritize_streamers else [False]
 
             if show_goalies_toggle:
-                display_cols = [c for c in ["Player", "Team", "Pos", "Fantasy_Team", "Acquired", "GP", "Overall_Rating", "W", "GAA", "SV%", "SO"] if c in active_pool.columns]
-                disp_df = active_pool[display_cols].sort_values(by="Overall_Rating", ascending=False)
+                display_cols = [c for c in ["Player", "Team", "Pos", "Fantasy_Team", "Acquired", "GP This Wk", "GP", "Overall_Rating", "W", "GAA", "SV%", "SO"] if c in active_pool.columns]
+                disp_df = active_pool[display_cols].sort_values(by=sort_cols, ascending=sort_asc)
                 styled_df = disp_df.style.map(lambda v: get_style_for_stat(v, "W", True, pace_mult), subset=["W"]) \
                                          .map(lambda v: get_style_for_stat(v, "GAA", True, 1.0), subset=["GAA"]) \
                                          .map(lambda v: get_style_for_stat(v, "SV%", True, 1.0), subset=["SV%"]) \
                                          .map(lambda v: get_style_for_stat(v, "SO", True, pace_mult), subset=["SO"]) \
                                          .map(lambda v: get_style_for_rating(v, True), subset=["Overall_Rating"]) \
                                          .format({
-                                             "GP": "{:.0f}", "W": "{:.0f}", "GAA": "{:.2f}",
+                                             "GP This Wk": "{:.0f}", "GP": "{:.0f}", "W": "{:.0f}", "GAA": "{:.2f}",
                                              "SV%": "{:.3f}", "SO": "{:.0f}", "Overall_Rating": "{:.2f}"
                                          })
             else:
-                display_cols = [c for c in ["Player", "Team", "Pos", "Fantasy_Team", "Acquired", "GP", "Overall_Rating", "G", "A", "+/-", "PPP", "S", "Hits", "BkS"] if c in active_pool.columns]
-                disp_df = active_pool[display_cols].sort_values(by="Overall_Rating", ascending=False)
+                display_cols = [c for c in ["Player", "Team", "Pos", "Fantasy_Team", "Acquired", "GP This Wk", "GP", "Overall_Rating", "G", "A", "+/-", "PPP", "S", "Hits", "BkS"] if c in active_pool.columns]
+                disp_df = active_pool[display_cols].sort_values(by=sort_cols, ascending=sort_asc)
                 styled_df = disp_df.style.map(lambda v: get_style_for_stat(v, "G", False, pace_mult), subset=["G"]) \
                                          .map(lambda v: get_style_for_stat(v, "A", False, pace_mult), subset=["A"]) \
                                          .map(lambda v: get_style_for_stat(v, "PPP", False, pace_mult), subset=["PPP"]) \
@@ -940,7 +994,7 @@ if app_mode == "📊 League & Waiver Hub":
                                          .map(lambda v: get_style_for_stat(v, "BkS", False, pace_mult) if "BkS" in disp_df.columns else None, subset=["BkS"] if "BkS" in disp_df.columns else []) \
                                          .map(lambda v: get_style_for_rating(v, False), subset=["Overall_Rating"]) \
                                          .format({
-                                             "GP": "{:.0f}", "G": "{:.0f}", "A": "{:.0f}", "PPP": "{:.0f}",
+                                             "GP This Wk": "{:.0f}", "GP": "{:.0f}", "G": "{:.0f}", "A": "{:.0f}", "PPP": "{:.0f}",
                                              "S": "{:.0f}", "+/-": "{:.0f}", "Hits": "{:.0f}", "BkS": "{:.0f}",
                                              "Overall_Rating": "{:.2f}"
                                          })
@@ -975,7 +1029,11 @@ elif app_mode == "🤝 Trade & Transaction Hub":
     st.title("🤝 Trade, Transaction & IR Hub")
     st.markdown("Execute trades, evaluate category impact, and manage injured reserve designations.")
 
-    tab_trade, tab_ir = st.tabs(["🔄 Trade Analyzer & Execution", "🚑 Injury & IR Ledger"])
+    tab_trade, tab_rec, tab_ir = st.tabs([
+        "🔄 Trade Analyzer & Execution", 
+        "🤖 Automated GM (Add/Drop & Trade Finder)", 
+        "🚑 Injury & IR Ledger"
+    ])
 
     with tab_trade:
         if unified_pool.empty:
@@ -1096,130 +1154,158 @@ elif app_mode == "🤝 Trade & Transaction Hub":
                     d_html += "</div>"
                     st.markdown(d_html, unsafe_allow_html=True)
 
+    with tab_rec:
+        st.subheader("🤖 AI Front Office: Roster Optimization & Trade Scout")
+        st.markdown("Automated scouting reports finding high-leverage waiver upgrades and mutually beneficial trade proposals.")
+
+    gm_team = st.selectbox("Select Team for Front Office Audit", all_teams_in_league, key="gm_target_team")
+
+    col_gm1, col_gm2 = st.columns(2)
+
+    # --- 1. ADD / DROP ADVISOR ---
+    with col_gm1:
+        st.markdown("#### 🗑️ Top Add/Drop Upgrades")
+        team_pool = unified_pool[unified_pool["Fantasy_Team"] == gm_team].copy()
+        fa_pool = unified_pool[unified_pool["Fantasy_Team"] == "Waiver Wire / Free Agent"].copy()
+
+        if team_pool.empty or fa_pool.empty:
+            st.info("Insufficient player data to generate waiver recommendations.")
+        else:
+            upgrades = []
+            for p_type in ["Skater", "Goalie"]:
+                t_sub = team_pool[team_pool["Position_Type"] == p_type].sort_values(by="Overall_Rating", ascending=True)
+                f_sub = fa_pool[fa_pool["Position_Type"] == p_type].sort_values(by="Overall_Rating", ascending=False)
+
+                if not t_sub.empty and not f_sub.empty:
+                    # Compare bottom rostered vs top free agents
+                    for i in range(min(3, len(t_sub), len(f_sub))):
+                        drop_candidate = t_sub.iloc[i]
+                        add_candidate = f_sub.iloc[i]
+                        gain = round(add_candidate["Overall_Rating"] - drop_candidate["Overall_Rating"], 2)
+
+                        if gain >= 0.25:
+                            upgrades.append({
+                                "Drop": f"{drop_candidate['Player']} ({drop_candidate['Pos']} - {drop_candidate['Team']})",
+                                "Drop Rating": f"{drop_candidate['Overall_Rating']:.2f}",
+                                "Add (FA)": f"{add_candidate['Player']} ({add_candidate['Pos']} - {add_candidate['Team']})",
+                                "Add Rating": f"{add_candidate['Overall_Rating']:.2f}",
+                                "Net Value Boost": f"+{gain:.2f}"
+                            })
+
+            if upgrades:
+                st.dataframe(pd.DataFrame(upgrades), use_container_width=True, hide_index=True)
+                st.caption("Only showing moves with an immediate, meaningful rating bump (+0.25 minimum).")
+            else:
+                st.success("Your roster is dialed in! No available Free Agents currently beat your lowest-rated players.")
+
+    # --- 2. TRADE MATCHMAKER ---
+    with col_gm2:
+        st.markdown("#### 🤝 Target Trade Partners")
+        st.caption("Searching for fair 1-for-1 swaps (within ±0.35 value) that address category balance.")
+
+        opponents = [t for t in all_teams_in_league if t != gm_team]
+        trade_targets = []
+
+        # Focus on top 5 players on this team to deal from strength
+        tradable_assets = team_pool.sort_values(by="Overall_Rating", ascending=False).head(6)
+
+        for opp in opponents:
+            opp_pool = unified_pool[unified_pool["Fantasy_Team"] == opp].copy()
+            if opp_pool.empty:
+                continue
+
+            for _, give_p in tradable_assets.iterrows():
+                val = give_p["Overall_Rating"]
+                # Find similar value players on opponent's team
+                matches = opp_pool[
+                    (opp_pool["Position_Type"] == give_p["Position_Type"]) &
+                    (opp_pool["Overall_Rating"].between(val - 0.35, val + 0.35)) &
+                    (opp_pool["Clean_Player"] != give_p["Clean_Player"])
+                ]
+
+                for _, get_p in matches.head(1).iterrows():
+                    diff = round(get_p["Overall_Rating"] - give_p["Overall_Rating"], 2)
+                    trade_targets.append({
+                        "Partner": opp,
+                        "Send": f"{give_p['Player']} ({give_p['Overall_Rating']:.2f})",
+                        "Receive": f"{get_p['Player']} ({get_p['Overall_Rating']:.2f})",
+                        "Net Swing": f"{diff:+.2f}"
+                    })
+
+        if trade_targets:
+            trade_targets_df = pd.DataFrame(trade_targets).drop_duplicates(subset=["Partner", "Send"]).head(8)
+            st.dataframe(trade_targets_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No balanced 1-for-1 swaps matching rating tolerance found.")
+
     with tab_ir:
         col_form, col_list = st.columns([1, 1.2])
 
-        with col_form:
-            st.subheader("Log an Injury")
-            with st.form("injury_form"):
-                all_rostered_names = sorted(unified_pool[unified_pool["Fantasy_Team"] != "Waiver Wire / Free Agent"]["Clean_Player"].unique().tolist()) if not unified_pool.empty else []
-                if all_rostered_names:
-                    inj_player = st.selectbox("Select Rostered Player", options=all_rostered_names)
-                else:
-                    inj_player = st.text_input("Player Name (Exact)")
-
-                inj_team = st.selectbox("Fantasy Team", all_teams_in_league)
-                inj_date = st.date_input("Date Placed on IR", datetime.date.today())
-                inj_status = st.selectbox("Designation", ["IR", "IR+", "Out (O)", "Day-to-Day (DTD)", "Season Ending"])
-                inj_notes = st.text_input("Injury Notes (e.g. Upper body, week-to-week)")
-                submit_injury = st.form_submit_button("Record Injury", use_container_width=True)
-
-                if submit_injury and inj_player:
-                    clean_entry = inj_player.replace(" (d)", "").replace(" (f)", "")
-                    local_injuries[clean_entry] = {
-                        "Fantasy_Team": inj_team,
-                        "Date": inj_date.strftime("%Y-%m-%d"),
-                        "Status": inj_status,
-                        "Notes": inj_notes
-                    }
-                    save_injuries(local_injuries)
-                    st.success(f"Recorded {inj_status} for {inj_player}.")
-                    st.rerun()
-
-        with col_list:
-            st.subheader("Hospital Ward (Active IR)")
-            if local_injuries:
-                ir_rows = []
-                for p, d in local_injuries.items():
-                    row = {"Player": p}
-                    row.update(d)
-                    ir_rows.append(row)
-                ir_df = pd.DataFrame(ir_rows).sort_values(by="Date", ascending=False)
-                st.dataframe(ir_df, use_container_width=True, hide_index=True)
-
-                st.markdown("---")
-                heal_target = st.selectbox("Activate / Heal Player", options=[""] + list(local_injuries.keys()))
-                if st.button("Activate Player (Remove from IR)", use_container_width=True):
-                    if heal_target and heal_target in local_injuries:
-                        del local_injuries[heal_target]
-                        save_injuries(local_injuries)
-                        st.success(f"{heal_target} activated and returned to full health.")
-                        st.rerun()
+    with col_form:
+        st.subheader("Log an Injury")
+        with st.form("injury_form"):
+            all_rostered_names = sorted(unified_pool[unified_pool["Fantasy_Team"] != "Waiver Wire / Free Agent"]["Clean_Player"].unique().tolist()) if not unified_pool.empty else []
+            if all_rostered_names:
+                inj_player = st.selectbox("Select Rostered Player", options=all_rostered_names)
             else:
-                st.info("No active injuries recorded.")
+                inj_player = st.text_input("Player Name (Exact)")
+
+            inj_team = st.selectbox("Fantasy Team", all_teams_in_league)
+            inj_date = st.date_input("Date Placed on IR", datetime.date.today())
+            inj_status = st.selectbox("Designation", ["IR", "IR+", "Out (O)", "Day-to-Day (DTD)", "Season Ending"])
+            inj_notes = st.text_input("Injury Notes (e.g. Upper body, week-to-week)")
+            submit_injury = st.form_submit_button("Record Injury", use_container_width=True)
+
+            if submit_injury and inj_player:
+                clean_entry = inj_player.replace(" (d)", "").replace(" (f)", "")
+                local_injuries[clean_entry] = {
+                    "Fantasy_Team": inj_team,
+                    "Date": inj_date.strftime("%Y-%m-%d"),
+                    "Status": inj_status,
+                    "Notes": inj_notes
+                }
+                save_injuries(local_injuries)
+                st.success(f"Recorded {inj_status} for {inj_player}.")
+                st.rerun()
+
+    with col_list:
+        st.subheader("Hospital Ward (Active IR)")
+        if local_injuries:
+            ir_rows = []
+            for p, d in local_injuries.items():
+                row = {"Player": p}
+                row.update(d)
+                ir_rows.append(row)
+            ir_df = pd.DataFrame(ir_rows).sort_values(by="Date", ascending=False)
+            st.dataframe(ir_df, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            heal_target = st.selectbox("Activate / Heal Player", options=[""] + list(local_injuries.keys()))
+            if st.button("Activate Player (Remove from IR)", use_container_width=True):
+                if heal_target and heal_target in local_injuries:
+                    del local_injuries[heal_target]
+                    save_injuries(local_injuries)
+                    st.success(f"{heal_target} activated and returned to full health.")
+                    st.rerun()
+        else:
+            st.info("No active injuries recorded.")
 
 
 # ==========================================
-# TAB 3: MATH & FORMULA INSPECTOR
+# TAB 3: THE WEEKLY GAZETTE & ORACLE
 # ==========================================
-elif app_mode == "📐 Math & Formula Inspector":
-    st.title("📐 Math & Formula Inspector")
-    st.markdown("Explore the absolute tiered grading scale and Goalie 4-category math model.")
+elif app_mode == "📰 League Gazette & The Oracle":
+    st.title("📰 League Gazette & The Oracle")
+    st.markdown("Your automated dose of league history, bad beats, waiver wire miracles, and predictive matchmaking.")
 
-    st.markdown(
-        """
-        <div class="math-box">
-            <h3>1. Skater Absolute Tiered Grading Scale (1.0 to 7.0)</h3>
-            <p>Every skater is evaluated equally across the 7 true category slots (Goals, Assists, PPP, Plus/Minus, Shots, Hits, Blocked Shots) using fixed 1-10 level thresholds mapped directly to a 1.0–7.0 scale (Hard Ceiling at 7.0):</p>
-            <ul>
-                <li><strong>Elite Levels (7 to 10):</strong> Highlighted in bold green.</li>
-                <li><strong>Mid Levels (4 to 6):</strong> Neutral / standard performance (uncolored).</li>
-                <li><strong>Liability Levels (1 to 3):</strong> Highlighted in soft red.</li>
-            </ul>
-        </div>
+    gazette_options: list[str] = ["Season to Date", "Last 4 Weeks"] + list(WEEKLY_SCHEDULE.keys())
 
-        <div class="math-box">
-            <h3>2. Roster Versatility Bonus (Dual Eligibility)</h3>
-            <p>Players assigned multiple fantasy positions (e.g., C/LW, LW/RW) receive an artificial <strong>+0.20 point bump</strong> to their Final Rating for each extra position beyond their primary role.</p>
-        </div>
-
-        <div class="math-box">
-            <h3>3. Goalie 4-Category Tiered Grading Scale (1.0 to 4.0)</h3>
-            <p>Goalies are evaluated across their 4 specific categories (Wins, GAA, Save Percentage, Shutouts) using fixed 1-10 level thresholds mapped directly to a 1.0–4.0 scale:</p>
-            <ul>
-                <li><strong>Wins & Shutouts:</strong> Higher volume yields higher tiers.</li>
-                <li><strong>GAA (Goals Against Average):</strong> Evaluated inversely (lower GAA receives elite green tiers).</li>
-                <li><strong>Save Percentage (SV%):</strong> Absolute threshold tiers ranging from sub-.880 to .925+.</li>
-            </ul>
-        </div>
-
-        <div class="math-box">
-            <h3>4. Durability & Availability Weighting</h3>
-            <p>To ensure part-time grinders or injury-prone players don't artificially outrank iron-man top-liners, a Games Played (GP) factor is applied:</p>
-            <p><code>Final Rating = 1.0 + (Rating Out of Max - 1.0) * max(0.3, GP / Baseline)</code></p>
-            <p>Players missing significant chunks of the season take a durability discount. Use the '82-Game Pace' toggle in the player pool filter to view raw per-game stat accumulation rates.</p>
-        </div>
-        
-        <div class="math-box">
-            <h3>5. Multi-Season 80/50/20 Aggregation</h3>
-            <p>When viewing the Multi-Season filter, stats are aggregated via a weighted average:</p>
-            <ul>
-                <li><strong>Most Recent Season (2025-26):</strong> 80% Weight (0.8)</li>
-                <li><strong>Prior Season (2024-25):</strong> 50% Weight (0.5)</li>
-                <li><strong>Two Seasons Ago (2023-24):</strong> 20% Weight (0.2)</li>
-            </ul>
-            <p>The total weighted stats are divided by 1.5 to output a true, single-season 82-game pace equivalent.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ==========================================
-# TAB 4: THE WEEKLY GAZETTE
-# ==========================================
-elif app_mode == "📰 Weekly Gazette / League Journal":
-    st.title("📰 The Weekly Gazette & League Journal")
-    st.markdown("Your automated dose of league history, bad beats, and waiver wire miracles.")
-    
-    gazette_options = ["Season to Date", "Last 4 Weeks"] + list(WEEKLY_SCHEDULE.keys())
-    
     col_sel, col_info = st.columns([1, 2])
     with col_sel:
         selected_week = st.selectbox("Select Matchup Week or Range", gazette_options)
-    
+
     today = datetime.date.today()
-    
+
     if selected_week == "Season to Date":
         start_d = "2026-09-29"
         end_d = today.strftime("%Y-%m-%d")
@@ -1233,337 +1319,502 @@ elif app_mode == "📰 Weekly Gazette / League Journal":
         start_d = week_info["start"]
         end_d = week_info["end"]
         playoff_tag = f" **🏆 {week_info['playoffs']}**" if "playoffs" in week_info else ""
-    
+
     with col_info:
         st.markdown("<br>", unsafe_allow_html=True)
         st.info(f"**Data Window:** {start_d} to {end_d}{playoff_tag}")
-        
+
     with st.spinner(f"Pulling NHL Box Scores for {selected_week}..."):
         wk_skaters = fetch_streak_data(start_d, end_d, fetch_goalies=False, pace_82=True)
         wk_goalies = fetch_streak_data(start_d, end_d, fetch_goalies=True, pace_82=True)
-        
-    if wk_skaters.empty and wk_goalies.empty:
-        st.warning(f"No NHL game data found between {start_d} and {end_d}. Check back once games have been played.")
-    else:
-        if not wk_skaters.empty:
-            wk_skaters["Fantasy_Team"] = wk_skaters["Clean_Player"].apply(lambda x: drafted_player_map.get(x, "Waiver Wire / Free Agent"))
-        if not wk_goalies.empty:
-            wk_goalies["Fantasy_Team"] = wk_goalies["Clean_Player"].apply(lambda x: drafted_player_map.get(x, "Waiver Wire / Free Agent"))
-        
-        st.markdown("---")
-        st.subheader("📰 Front Page Headlines")
-        
-        if not wk_skaters.empty:
-            team_scoring = wk_skaters[wk_skaters["Fantasy_Team"] != "Waiver Wire / Free Agent"].groupby("Fantasy_Team")[["G", "A", "Hits", "BkS"]].sum().reset_index()
-            if not team_scoring.empty and len(team_scoring) > 1:
-                team_scoring["Points"] = team_scoring["G"] + team_scoring["A"]
-                juggernaut = team_scoring.sort_values(by="Points", ascending=False).iloc[0]
-                basement = team_scoring.sort_values(by="Points", ascending=True).iloc[0]
-                
-                st.success(f"🔥 **THE JUGGERNAUT:** **{juggernaut['Fantasy_Team']}** chose violence this period, hanging a league-leading {juggernaut['Points']:.0f} points ({juggernaut['G']:.0f}G, {juggernaut['A']:.0f}A) on their opponents. Absolutely ruthless.")
-                st.error(f"🧊 **THE ICE COLD:** Thoughts and prayers to **{basement['Fantasy_Team']}**, whose roster collectively forgot how to play hockey, mustering a pitiful {basement['Points']:.0f} total points. Time to hit the waiver wire.")
 
-        st.markdown("---")
-        st.subheader("🎭 The League Award Ceremony")
-        st.markdown("Celebrating the heroes, the villains, and the guys who just showed up for the free Gatorade. *(Reload the page to see different awards!)*")
-        
-        available_awards = []
-        rostered_skaters = wk_skaters[wk_skaters["Fantasy_Team"] != "Waiver Wire / Free Agent"] if not wk_skaters.empty else pd.DataFrame()
-        rostered_goalies = wk_goalies[wk_goalies["Fantasy_Team"] != "Waiver Wire / Free Agent"] if not wk_goalies.empty else pd.DataFrame()
-        
-        if not rostered_skaters.empty:
-            c_pool = rostered_skaters[(rostered_skaters["G"] == 0) & (rostered_skaters["A"] == 0) & (rostered_skaters["Hits"] == 0) & (rostered_skaters["BkS"] == 0)]
-            if not c_pool.empty:
-                w = c_pool.sort_values(by="GP", ascending=False).iloc[0]
-                if w["GP"] >= 2:
-                    available_awards.append({
-                        "style": "info", "icon": "🏃", "name": "The Cardio King",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Suited up for {w['GP']:.0f} games with 0 points, 0 hits, and 0 blocks. Pure aerobic exercise."
-                    })
-            
-            s_pool = rostered_skaters[(rostered_skaters["G"] == 0) & (rostered_skaters["A"] == 0)].copy()
-            if not s_pool.empty:
-                s_pool["Grit"] = s_pool["Hits"] + s_pool["BkS"]
-                w = s_pool.sort_values(by="Grit", ascending=False).iloc[0]
-                if w["Grit"] >= 5:
-                    available_awards.append({
-                        "style": "warning", "icon": "🛡️", "name": "The Human Pincushion",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"{w['Grit']:.0f} combined hits & blocks with zero offensive production. This man hates his own bones."
-                    })
+    tab_gazette, tab_oracle = st.tabs(["📰 Weekly Gazette & Awards", "🔮 The Oracle & Matchup Simulator"])
 
-            w = rostered_skaters.sort_values(by="+/-", ascending=True).iloc[0]
-            if w["+/-"] <= -3:
-                available_awards.append({
-                    "style": "error", "icon": "🕳️", "name": "The Plus/Minus Abyss",
-                    "player": w["Player"], "team": w["Fantasy_Team"],
-                    "desc": f"A catastrophic {w['+/-']:.0f} rating. He was on the ice for so many goals against, he might as well have bought a ticket."
-                })
-
-            fa_pool = rostered_skaters[rostered_skaters["Clean_Player"].apply(lambda x: acquisition_map.get(x) == "🔄 Trade/Waiver")]
-            if not fa_pool.empty:
-                w = fa_pool.sort_values(by="Overall_Rating", ascending=False).iloc[0]
-                available_awards.append({
-                    "style": "success", "icon": "🎯", "name": "Galaxy-Brain Streamer",
-                    "player": w["Player"], "team": w["Fantasy_Team"],
-                    "desc": f"Scooped off the scrap heap to deliver {w['G']:.0f}G, {w['A']:.0f}A, and a {w['Overall_Rating']:.2f} Rating. Give this GM a front office job."
-                })
-
-            st_pool = rostered_skaters[rostered_skaters["G"] == 0]
-            if not st_pool.empty:
-                w = st_pool.sort_values(by="S", ascending=False).iloc[0]
-                if w["S"] >= 8:
-                    available_awards.append({
-                        "style": "warning", "icon": "🎯", "name": "The Stormtrooper",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Fired {w['S']:.0f} shots on net and hit absolutely nothing. Someone check this man's stick tape."
-                    })
-
-            cy_pool = rostered_skaters[(rostered_skaters["G"] > 0) & (rostered_skaters["A"] == 0)]
-            if not cy_pool.empty:
-                w = cy_pool.sort_values(by="G", ascending=False).iloc[0]
-                if w["G"] >= 2:
-                    available_awards.append({
-                        "style": "info", "icon": "⚾", "name": "The Cy Young Award",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"An elite {w['G']:.0f}-{w['A']:.0f} stat line. Passing the puck is strictly forbidden for this guy."
-                    })
-
-            ph_pool = rostered_skaters[(rostered_skaters["A"] > 0) & (rostered_skaters["G"] == 0)]
-            if not ph_pool.empty:
-                w = ph_pool.sort_values(by="A", ascending=False).iloc[0]
-                if w["A"] >= 3:
-                    available_awards.append({
-                        "style": "success", "icon": "🤝", "name": "The Philanthropist",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Dished out {w['A']:.0f} assists without ever looking at the net. A true man of the people."
-                    })
-
-            sg_pool = rostered_skaters[(rostered_skaters["G"] > 0) & (rostered_skaters["G"] == rostered_skaters["S"])]
-            if not sg_pool.empty:
-                w = sg_pool.sort_values(by="G", ascending=False).iloc[0]
-                available_awards.append({
-                    "style": "warning", "icon": "👽", "name": "The Sniper Gremlin",
-                    "player": w["Player"], "team": w["Fantasy_Team"],
-                    "desc": f"Scored {w['G']:.0f} goal(s) on exactly {w['S']:.0f} shot(s). A 100% shooting percentage that defies the laws of physics."
-                })
-
-            pp_pool = rostered_skaters[rostered_skaters["PPP"] >= 2]
-            if not pp_pool.empty:
-                w = pp_pool.sort_values(by="PPP", ascending=False).iloc[0]
-                available_awards.append({
-                    "style": "info", "icon": "⚡", "name": "The Powerplay Merchant",
-                    "player": w["Player"], "team": w["Fantasy_Team"],
-                    "desc": f"Racked up {w['PPP']:.0f} powerplay points. Essentially useless at 5-on-5, but a god with the man advantage."
-                })
-
-        if not rostered_goalies.empty:
-            min_gp = 2 if selected_week in ["Season to Date", "Last 4 Weeks"] else 1
-            cg_pool = rostered_goalies[(rostered_goalies["W"] >= 1) & (rostered_goalies["GP"] >= min_gp)]
-            if not cg_pool.empty:
-                w = cg_pool.sort_values(by="GAA", ascending=False).iloc[0]
-                if w["GAA"] >= 3.0:
-                    available_awards.append({
-                        "style": "error", "icon": "🚨", "name": "Cardiac Arrest Goalie",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Secured a Win despite a terrifying {w['GAA']:.2f} GAA. Apologies to this manager's blood pressure."
-                    })
-
-            sc_pool = rostered_goalies[rostered_goalies["SV%"] > 0]
-            if not sc_pool.empty:
-                w = sc_pool.sort_values(by="SV%", ascending=True).iloc[0]
-                if w["SV%"] <= 0.860:
-                    available_awards.append({
-                        "style": "error", "icon": "🧀", "name": "Swiss Cheese Netminder",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Stopped beachballs at a dismal {w['SV%']:.3f} clip. Might have been better off using a shooter tutor."
-                    })
-
-            bw_pool = rostered_goalies[rostered_goalies["SV%"] > 0]
-            if not bw_pool.empty:
-                w = bw_pool.sort_values(by="SV%", ascending=False).iloc[0]
-                if w["SV%"] >= 0.940 and w["GP"] >= 2:
-                    available_awards.append({
-                        "style": "success", "icon": "🧱", "name": "The Brick Wall",
-                        "player": w["Player"], "team": w["Fantasy_Team"],
-                        "desc": f"Put up a ridiculous {w['SV%']:.3f} Save Percentage over {w['GP']:.0f} games. Absolutely unbothered."
-                    })
-
-        random.shuffle(available_awards)
-        selected_awards = available_awards[:6]
-        
-        for i in range(0, len(selected_awards), 3):
-            cols = st.columns(3)
-            for j, col in enumerate(cols):
-                if i + j < len(selected_awards):
-                    aw = selected_awards[i + j]
-                    with col:
-                        callout = getattr(st, aw["style"])
-                        callout(f"{aw['icon']} **{aw['name']}**\n\n**{aw['player']}**\n\n*{aw['team']}*")
-                        st.caption(f"**Reporter's Note:** {aw['desc']}")
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-                    
-        # --- TRUE STRENGTH MATRIX ---
-        st.markdown("---")
-        st.subheader("📊 The 'No Excuses' Matchup Matrix & All-Play Record")
-        st.markdown("If every team played a head-to-head matchup against *every other team* during this exact timeframe, who would have actually won? This ranking exposes the lucky frauds and vindicates the unlucky.")
-        
-        team_totals = []
-        for t in all_teams_in_league:
-            t_data = {"Team": t, "G": 0, "A": 0, "+/-": 0, "PPP": 0, "S": 0, "Hits": 0, "BkS": 0, "W": 0, "SV%": 0.0, "GAA": 0.0, "SO": 0}
-            
+    with tab_gazette:
+        if wk_skaters.empty and wk_goalies.empty:
+            st.warning(f"No NHL game data found between {start_d} and {end_d}. Check back once games have been played.")
+        else:
             if not wk_skaters.empty:
-                t_skaters = wk_skaters[wk_skaters["Fantasy_Team"] == t]
-                if not t_skaters.empty:
-                    for col in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS"]:
-                        t_data[col] = t_skaters[col].sum()
-                        
+                wk_skaters["Fantasy_Team"] = wk_skaters["Clean_Player"].apply(lambda x: drafted_player_map.get(x, "Waiver Wire / Free Agent"))
             if not wk_goalies.empty:
-                t_goalies = wk_goalies[wk_goalies["Fantasy_Team"] == t]
-                if not t_goalies.empty and t_goalies["GP"].sum() > 0:
-                    t_data["W"] = t_goalies["W"].sum()
-                    t_data["SO"] = t_goalies["SO"].sum()
-                    t_data["GAA"] = t_goalies["GAA"].mean()
-                    t_data["SV%"] = t_goalies["SV%"].mean() 
-                else:
-                    t_data["GAA"] = 99.99 
-                    t_data["SV%"] = 0.00
+                wk_goalies["Fantasy_Team"] = wk_goalies["Clean_Player"].apply(lambda x: drafted_player_map.get(x, "Waiver Wire / Free Agent"))
+
+            st.subheader("📰 Front Page Headlines")
+
+            if not wk_skaters.empty:
+                team_scoring = wk_skaters[wk_skaters["Fantasy_Team"] != "Waiver Wire / Free Agent"].groupby("Fantasy_Team")[["G", "A", "Hits", "BkS"]].sum().reset_index()
+                if not team_scoring.empty and len(team_scoring) > 1:
+                    team_scoring["Points"] = team_scoring["G"] + team_scoring["A"]
+                    juggernaut = team_scoring.sort_values(by="Points", ascending=False).iloc[0]
+                    basement = team_scoring.sort_values(by="Points", ascending=True).iloc[0]
+
+                    st.success(f"🔥 **THE JUGGERNAUT:** **{juggernaut['Fantasy_Team']}** chose violence this period, hanging a league-leading {juggernaut['Points']:.0f} points ({juggernaut['G']:.0f}G, {juggernaut['A']:.0f}A) on their opponents. Absolutely ruthless.")
+                    st.error(f"🧊 **THE ICE COLD:** Thoughts and prayers to **{basement['Fantasy_Team']}**, whose roster collectively forgot how to play hockey, mustering a pitiful {basement['Points']:.0f} total points. Time to hit the waiver wire.")
+
+            st.markdown("---")
+            st.subheader("🎭 The League Award Ceremony")
+            st.markdown("Celebrating the heroes, the villains, and the guys who just showed up for the free Gatorade. *(Reload the page to see different awards!)*")
+
+            available_awards = []
+            rostered_skaters = wk_skaters[wk_skaters["Fantasy_Team"] != "Waiver Wire / Free Agent"] if not wk_skaters.empty else pd.DataFrame()
+            rostered_goalies = wk_goalies[wk_goalies["Fantasy_Team"] != "Waiver Wire / Free Agent"] if not wk_goalies.empty else pd.DataFrame()
+
+            if not rostered_skaters.empty:
+                c_pool = rostered_skaters[(rostered_skaters["G"] == 0) & (rostered_skaters["A"] == 0) & (rostered_skaters["Hits"] == 0) & (rostered_skaters["BkS"] == 0)]
+                if not c_pool.empty:
+                    w = c_pool.sort_values(by="GP", ascending=False).iloc[0]
+                    if w["GP"] >= 2:
+                        available_awards.append({
+                            "style": "info", "icon": "🏃", "name": "The Cardio King",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Suited up for {w['GP']:.0f} games with 0 points, 0 hits, and 0 blocks. Pure aerobic exercise."
+                        })
+
+                s_pool = rostered_skaters[(rostered_skaters["G"] == 0) & (rostered_skaters["A"] == 0)].copy()
+                if not s_pool.empty:
+                    s_pool["Grit"] = s_pool["Hits"] + s_pool["BkS"]
+                    w = s_pool.sort_values(by="Grit", ascending=False).iloc[0]
+                    if w["Grit"] >= 5:
+                        available_awards.append({
+                            "style": "warning", "icon": "🛡️", "name": "The Human Pincushion",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"{w['Grit']:.0f} combined hits & blocks with zero offensive production. This man hates his own bones."
+                        })
+
+                w = rostered_skaters.sort_values(by="+/-", ascending=True).iloc[0]
+                if w["+/-"] <= -3:
+                    available_awards.append({
+                        "style": "error", "icon": "🕳️", "name": "The Plus/Minus Abyss",
+                        "player": w["Player"], "team": w["Fantasy_Team"],
+                        "desc": f"A catastrophic {w['+/-']:.0f} rating. He was on the ice for so many goals against, he might as well have bought a ticket."
+                    })
+
+                fa_pool = rostered_skaters[rostered_skaters["Clean_Player"].apply(lambda x: acquisition_map.get(x) == "🔄 Trade/Waiver")]
+                if not fa_pool.empty:
+                    w = fa_pool.sort_values(by="Overall_Rating", ascending=False).iloc[0]
+                    available_awards.append({
+                        "style": "success", "icon": "🎯", "name": "Galaxy-Brain Streamer",
+                        "player": w["Player"], "team": w["Fantasy_Team"],
+                        "desc": f"Scooped off the scrap heap to deliver {w['G']:.0f}G, {w['A']:.0f}A, and a {w['Overall_Rating']:.2f} Rating. Give this GM a front office job."
+                    })
+
+                st_pool = rostered_skaters[rostered_skaters["G"] == 0]
+                if not st_pool.empty:
+                    w = st_pool.sort_values(by="S", ascending=False).iloc[0]
+                    if w["S"] >= 8:
+                        available_awards.append({
+                            "style": "warning", "icon": "🎯", "name": "The Stormtrooper",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Fired {w['S']:.0f} shots on net and hit absolutely nothing. Someone check this man's stick tape."
+                        })
+
+                cy_pool = rostered_skaters[(rostered_skaters["G"] > 0) & (rostered_skaters["A"] == 0)]
+                if not cy_pool.empty:
+                    w = cy_pool.sort_values(by="G", ascending=False).iloc[0]
+                    if w["G"] >= 2:
+                        available_awards.append({
+                            "style": "info", "icon": "⚾", "name": "The Cy Young Award",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"An elite {w['G']:.0f}-{w['A']:.0f} stat line. Passing the puck is strictly forbidden for this guy."
+                        })
+
+                ph_pool = rostered_skaters[(rostered_skaters["A"] > 0) & (rostered_skaters["G"] == 0)]
+                if not ph_pool.empty:
+                    w = ph_pool.sort_values(by="A", ascending=False).iloc[0]
+                    if w["A"] >= 3:
+                        available_awards.append({
+                            "style": "success", "icon": "🤝", "name": "The Philanthropist",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Dished out {w['A']:.0f} assists without ever looking at the net. A true man of the people."
+                        })
+
+                sg_pool = rostered_skaters[(rostered_skaters["G"] > 0) & (rostered_skaters["G"] == rostered_skaters["S"])]
+                if not sg_pool.empty:
+                    w = sg_pool.sort_values(by="G", ascending=False).iloc[0]
+                    available_awards.append({
+                        "style": "warning", "icon": "👽", "name": "The Sniper Gremlin",
+                        "player": w["Player"], "team": w["Fantasy_Team"],
+                        "desc": f"Scored {w['G']:.0f} goal(s) on exactly {w['S']:.0f} shot(s). A 100% shooting percentage that defies the laws of physics."
+                    })
+
+                pp_pool = rostered_skaters[rostered_skaters["PPP"] >= 2]
+                if not pp_pool.empty:
+                    w = pp_pool.sort_values(by="PPP", ascending=False).iloc[0]
+                    available_awards.append({
+                        "style": "info", "icon": "⚡", "name": "The Powerplay Merchant",
+                        "player": w["Player"], "team": w["Fantasy_Team"],
+                        "desc": f"Racked up {w['PPP']:.0f} powerplay points. Essentially useless at 5-on-5, but a god with the man advantage."
+                    })
+
+            if not rostered_goalies.empty:
+                min_gp = 2 if selected_week in ["Season to Date", "Last 4 Weeks"] else 1
+                cg_pool = rostered_goalies[(rostered_goalies["W"] >= 1) & (rostered_goalies["GP"] >= min_gp)]
+                if not cg_pool.empty:
+                    w = cg_pool.sort_values(by="GAA", ascending=False).iloc[0]
+                    if w["GAA"] >= 3.0:
+                        available_awards.append({
+                            "style": "error", "icon": "🚨", "name": "Cardiac Arrest Goalie",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Secured a Win despite a terrifying {w['GAA']:.2f} GAA. Apologies to this manager's blood pressure."
+                        })
+
+                sc_pool = rostered_goalies[rostered_goalies["SV%"] > 0]
+                if not sc_pool.empty:
+                    w = sc_pool.sort_values(by="SV%", ascending=True).iloc[0]
+                    if w["SV%"] <= 0.860:
+                        available_awards.append({
+                            "style": "error", "icon": "🧀", "name": "Swiss Cheese Netminder",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Stopped beachballs at a dismal {w['SV%']:.3f} clip. Might have been better off using a shooter tutor."
+                        })
+
+                bw_pool = rostered_goalies[rostered_goalies["SV%"] > 0]
+                if not bw_pool.empty:
+                    w = bw_pool.sort_values(by="SV%", ascending=False).iloc[0]
+                    if w["SV%"] >= 0.940 and w["GP"] >= 2:
+                        available_awards.append({
+                            "style": "success", "icon": "🧱", "name": "The Brick Wall",
+                            "player": w["Player"], "team": w["Fantasy_Team"],
+                            "desc": f"Put up a ridiculous {w['SV%']:.3f} Save Percentage over {w['GP']:.0f} games. Absolutely unbothered."
+                        })
+
+            random.shuffle(available_awards)
+            selected_awards = available_awards[:6]
+
+            for i in range(0, len(selected_awards), 3):
+                cols = st.columns(3)
+                for j, col in enumerate(cols):
+                    if i + j < len(selected_awards):
+                        aw = selected_awards[i + j]
+                        with col:
+                            callout = getattr(st, aw["style"])
+                            callout(f"{aw['icon']} **{aw['name']}**\n\n**{aw['player']}**\n\n*{aw['team']}*")
+                            st.caption(f"**Reporter's Note:** {aw['desc']}")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # --- TRUE STRENGTH MATRIX ---
+            st.markdown("---")
+            st.subheader("📊 The 'No Excuses' Matchup Matrix & All-Play Record")
+            st.markdown("If every team played a head-to-head matchup against *every other team* during this exact timeframe, who would have actually won? This ranking exposes the lucky frauds and vindicates the unlucky.")
+            
+            team_totals = []
+            for t in all_teams_in_league:
+                t_data = {"Team": t, "G": 0, "A": 0, "+/-": 0, "PPP": 0, "S": 0, "Hits": 0, "BkS": 0, "W": 0, "SV%": 0.0, "GAA": 0.0, "SO": 0}
+                
+                if not wk_skaters.empty:
+                    t_skaters = wk_skaters[wk_skaters["Fantasy_Team"] == t]
+                    if not t_skaters.empty:
+                        for col in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS"]:
+                            t_data[col] = t_skaters[col].sum()
+                            
+                if not wk_goalies.empty:
+                    t_goalies = wk_goalies[wk_goalies["Fantasy_Team"] == t]
+                    if not t_goalies.empty and t_goalies["GP"].sum() > 0:
+                        t_data["W"] = t_goalies["W"].sum()
+                        t_data["SO"] = t_goalies["SO"].sum()
+                        t_data["GAA"] = t_goalies["GAA"].mean()
+                        t_data["SV%"] = t_goalies["SV%"].mean() 
+                    else:
+                        t_data["GAA"] = 99.99 
+                        t_data["SV%"] = 0.00
+                        
+                team_totals.append(t_data)
+                
+            for i, t1 in enumerate(team_totals):
+                w, l, tie = 0, 0, 0
+                for j, t2 in enumerate(team_totals):
+                    if i == j: continue
+                    cats_won, cats_lost = 0, 0
+                    for cat in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"]:
+                        if t1[cat] > t2[cat]: cats_won += 1
+                        elif t1[cat] < t2[cat]: cats_lost += 1
                     
-            team_totals.append(t_data)
+                    if t1["GAA"] < t2["GAA"]: cats_won += 1
+                    elif t1["GAA"] > t2["GAA"]: cats_lost += 1
+                    
+                    if cats_won > cats_lost: w += 1
+                    elif cats_won < cats_lost: l += 1
+                    else: tie += 1
+                    
+                t1["All-Play Rank (W-L-T)"] = f"{w}-{l}-{tie}"
+                t1["_Sort_W"] = w 
+                
+            tt_df = pd.DataFrame(team_totals)
             
-        for i, t1 in enumerate(team_totals):
-            w, l, tie = 0, 0, 0
-            for j, t2 in enumerate(team_totals):
-                if i == j: continue
-                cats_won, cats_lost = 0, 0
-                for cat in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"]:
-                    if t1[cat] > t2[cat]: cats_won += 1
-                    elif t1[cat] < t2[cat]: cats_lost += 1
+            for cat in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"]:
+                tt_df[f"{cat}_Rk"] = tt_df[cat].rank(method='average')
                 
-                if t1["GAA"] < t2["GAA"]: cats_won += 1
-                elif t1["GAA"] > t2["GAA"]: cats_lost += 1
-                
-                if cats_won > cats_lost: w += 1
-                elif cats_won < cats_lost: l += 1
-                else: tie += 1
-                
-            t1["All-Play Rank (W-L-T)"] = f"{w}-{l}-{tie}"
-            t1["_Sort_W"] = w 
+            tt_df["GAA_Rk"] = tt_df["GAA"].rank(method='average', ascending=False)
+            rank_cols = [c for c in tt_df.columns if c.endswith("_Rk")]
+            tt_df["Total_Roto"] = tt_df[rank_cols].sum(axis=1)
+            tt_df["Rating (/10)"] = (tt_df["Total_Roto"] / 88.0) * 10.0
+            tt_df = tt_df.drop(columns=rank_cols + ["Total_Roto"])
             
-        tt_df = pd.DataFrame(team_totals)
-        
-        for cat in ["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"]:
-            tt_df[f"{cat}_Rk"] = tt_df[cat].rank(method='average')
+            tt_df = tt_df.sort_values(by=["_Sort_W", "Rating (/10)"], ascending=[False, False]).drop(columns=["_Sort_W"])
+            cols = ["Team", "Rating (/10)", "All-Play Rank (W-L-T)"] + [c for c in tt_df.columns if c not in ["Team", "Rating (/10)", "All-Play Rank (W-L-T)"]]
+            tt_df = tt_df[cols]
             
-        tt_df["GAA_Rk"] = tt_df["GAA"].rank(method='average', ascending=False)
-        rank_cols = [c for c in tt_df.columns if c.endswith("_Rk")]
-        tt_df["Total_Roto"] = tt_df[rank_cols].sum(axis=1)
-        tt_df["Rating (/10)"] = (tt_df["Total_Roto"] / 88.0) * 10.0
-        tt_df = tt_df.drop(columns=rank_cols + ["Total_Roto"])
-        
-        tt_df = tt_df.sort_values(by=["_Sort_W", "Rating (/10)"], ascending=[False, False]).drop(columns=["_Sort_W"])
-        cols = ["Team", "Rating (/10)", "All-Play Rank (W-L-T)"] + [c for c in tt_df.columns if c not in ["Team", "Rating (/10)", "All-Play Rank (W-L-T)"]]
-        tt_df = tt_df[cols]
-        
-        st.dataframe(
-            tt_df.style.highlight_max(subset=["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"], color="#51cf66")
-                       .highlight_min(subset=["GAA"], color="#51cf66")
-                       .highlight_min(subset=["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"], color="#ff6b6b")
-                       .highlight_max(subset=["GAA"], color="#ff6b6b")
-                       .format({
-                           "Rating (/10)": "⭐ {:.1f}",
-                           "G": "{:.0f}", "A": "{:.0f}", "+/-": "{:.0f}", "PPP": "{:.0f}", 
-                           "S": "{:.0f}", "Hits": "{:.0f}", "BkS": "{:.0f}", "W": "{:.0f}", 
-                           "SO": "{:.0f}", "GAA": "{:.2f}", "SV%": "{:.3f}"
-                       }),
-            use_container_width=True, 
-            hide_index=True
-        )
-        st.caption("*(⭐ Rating / 10 is calculated across all 11 categories. Green indicates league-best; Red indicates league-worst. GAA of 99.99 indicates no goalies were played.)*")
+            st.dataframe(
+                tt_df.style.highlight_max(subset=["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"], color="#51cf66")
+                           .highlight_min(subset=["GAA"], color="#51cf66")
+                           .highlight_min(subset=["G", "A", "+/-", "PPP", "S", "Hits", "BkS", "W", "SV%", "SO"], color="#ff6b6b")
+                           .highlight_max(subset=["GAA"], color="#ff6b6b")
+                           .format({
+                               "Rating (/10)": "⭐ {:.1f}",
+                               "G": "{:.0f}", "A": "{:.0f}", "+/-": "{:.0f}", "PPP": "{:.0f}", 
+                               "S": "{:.0f}", "Hits": "{:.0f}", "BkS": "{:.0f}", "W": "{:.0f}", 
+                               "SO": "{:.0f}", "GAA": "{:.2f}", "SV%": "{:.3f}"
+                           }),
+                use_container_width=True, 
+                hide_index=True
+            )
+            st.caption("*(⭐ Rating / 10 is calculated across all 11 categories. Green indicates league-best; Red indicates league-worst. GAA of 99.99 indicates no goalies were played.)*")
 
-
-# ==========================================
-# TAB 5: THE ORACLE PROJECTIONS
-# ==========================================
-elif app_mode == "🔮 Oracle Projections (Beat the Val Model)":
-    st.title("🔮 The Gazette Oracle: Season Forecasting")
-    st.markdown("Comparing our custom Tiered Rating engine against the rest of the league to predict the true end-of-season standings.")
-
-    if unified_pool.empty:
-        st.warning("No player data available. Please check your date filters.")
-    else:
-        st.info("💡 **How it works:** The Gazette Model calculates the 'True Talent' of a team by summing the Overall Tiered Ratings (1.0-7.0 for skaters, 1.0-4.0 for goalies) of every active player on their roster.")
-        
-        proj_data = []
-        for t in all_teams_in_league:
-            t_pool = unified_pool[unified_pool["Fantasy_Team"] == t]
-            if not t_pool.empty:
-                skaters = t_pool[t_pool["Position_Type"] == "Skater"]
-                goalies = t_pool[t_pool["Position_Type"] == "Goalie"]
-                skater_power = skaters["Overall_Rating"].sum() if not skaters.empty else 0.0
-                goalie_power = goalies["Overall_Rating"].sum() if not goalies.empty else 0.0
+    with tab_oracle:
+        if unified_pool.empty:
+            st.warning("No player data available. Please check your date filters.")
+        else:
+            st.subheader("Season Forecasting (True Talent)")
+            st.info("💡 **How it works:** The Gazette Model calculates the 'True Talent' of a team by summing the Overall Tiered Ratings (1.0-7.0 for skaters, 1.0-4.0 for goalies) of every active player on their roster.")
+            
+            proj_data = []
+            for t in all_teams_in_league:
+                t_pool = unified_pool[unified_pool["Fantasy_Team"] == t]
+                if not t_pool.empty:
+                    skaters = t_pool[t_pool["Position_Type"] == "Skater"]
+                    goalies = t_pool[t_pool["Position_Type"] == "Goalie"]
+                    skater_power = skaters["Overall_Rating"].sum() if not skaters.empty else 0.0
+                    goalie_power = goalies["Overall_Rating"].sum() if not goalies.empty else 0.0
+                    
+                    normalized_goalie_power = goalie_power * 1.75
+                    total_power = skater_power + normalized_goalie_power
+                    top_players = t_pool.sort_values(by="Overall_Rating", ascending=False).head(3)["Player"].tolist()
+                    
+                    proj_data.append({
+                        "Team": t,
+                        "Total Roster Power": total_power,
+                        "Skater Strength": skater_power,
+                        "Goalie Strength": goalie_power,
+                        "Roster Size": len(t_pool),
+                        "Franchise Cornerstones": ", ".join(top_players)
+                    })
+                    
+            proj_df = pd.DataFrame(proj_data)
+            if not proj_df.empty:
+                proj_df = proj_df.sort_values(by="Total Roster Power", ascending=False).reset_index(drop=True)
+                proj_df.index = proj_df.index + 1
                 
-                normalized_goalie_power = goalie_power * 1.75
-                total_power = skater_power + normalized_goalie_power
-                top_players = t_pool.sort_values(by="Overall_Rating", ascending=False).head(3)["Player"].tolist()
+                assessments = []
+                for rank in proj_df.index:
+                    if rank == 1:
+                        assessments.append("🏆 Championship Favorite (Elite Underlying Talent)")
+                    elif rank in [2, 3]:
+                        assessments.append("⚔️ Heavyweight Contender (Built for the Playoffs)")
+                    elif rank in [4, 5]:
+                        assessments.append("⚖️ Mid-Tier Threat (One trade away from contending)")
+                    elif rank in [6, 7]:
+                        assessments.append("⚠️ Paper Tiger / Rebuild Needed (Statistically weak)")
+                    else:
+                        assessments.append("🪦 The Basement (Mathematically eliminated by the Oracle)")
                 
-                proj_data.append({
-                    "Team": t,
-                    "Total Roster Power": total_power,
-                    "Skater Strength": skater_power,
-                    "Goalie Strength": goalie_power,
-                    "Roster Size": len(t_pool),
-                    "Franchise Cornerstones": ", ".join(top_players)
+                proj_df.insert(2, "Gazette Model Assessment", assessments)
+                
+                st.dataframe(
+                    proj_df.style.background_gradient(subset=["Total Roster Power", "Skater Strength", "Goalie Strength"], cmap="viridis")
+                                 .format({
+                                     "Total Roster Power": "{:.2f}",
+                                     "Skater Strength": "{:.2f}",
+                                     "Goalie Strength": "{:.2f}"
+                                 }),
+                    use_container_width=True
+                )
+                
+                st.markdown("---")
+                st.subheader("🆚 Model vs. Model Breakdown")
+                
+                top_team = proj_df.iloc[0]
+                bottom_team = proj_df.iloc[-1]
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.success(f"**The Gazette's Chosen Champion:** {top_team['Team']}")
+                    st.write(f"**Total Power Score:** {top_team['Total Roster Power']:.2f}")
+                    st.write(f"**Led By:** {top_team['Franchise Cornerstones']}")
+                    st.caption("This team possesses the highest aggregate multi-category potential in the league.")
+                    
+                with col2:
+                    st.error(f"**The Gazette's Rebuild Candidate:** {bottom_team['Team']}")
+                    st.write(f"**Total Power Score:** {bottom_team['Total Roster Power']:.2f}")
+                    st.write(f"**Led By:** {bottom_team['Franchise Cornerstones']}")
+                    st.caption("Regardless of their current real-life standing, this roster is mathematically hollow.")
+
+            st.markdown("---")
+            st.subheader("⚔️ Weekly Matchup Projection")
+            st.markdown("Projects total category accumulation based on a player's seasonal per-game average multiplied by their real-life team's games remaining this week.")
+            
+            team_games, _ = fetch_weekly_schedule_counts(start_d, end_d)
+            
+            col_t1, col_t2 = st.columns(2)
+            with col_t1:
+                team_a = st.selectbox("Select Team A", all_teams_in_league, index=0)
+            with col_t2:
+                team_b = st.selectbox("Select Team B", all_teams_in_league, index=1 if len(all_teams_in_league) > 1 else 0)
+                
+            def calculate_projected_totals(team_name):
+                pool = unified_pool[unified_pool["Fantasy_Team"] == team_name].copy()
+                totals = {"G": 0.0, "A": 0.0, "PPP": 0.0, "S": 0.0, "+/-": 0.0, "Hits": 0.0, "BkS": 0.0, "W": 0.0, "SO": 0.0, "Games_Played": 0}
+                if pool.empty: return totals
+                
+                pool["Proj_Games"] = pool["Team"].apply(lambda x: team_games.get(x, 0))
+                
+                for _, row in pool.iterrows():
+                    gp = max(row.get("GP", 1), 1)
+                    proj_g = row["Proj_Games"]
+                    totals["Games_Played"] += proj_g
+                    
+                    if row["Position_Type"] == "Skater":
+                        for cat in ["G", "A", "PPP", "S", "+/-", "Hits", "BkS"]:
+                            if cat in row:
+                                totals[cat] += (row[cat] / gp) * proj_g
+                    else:
+                        for cat in ["W", "SO"]:
+                            if cat in row:
+                                totals[cat] += (row[cat] / gp) * proj_g
+                                
+                return totals
+                
+            proj_a = calculate_projected_totals(team_a)
+            proj_b = calculate_projected_totals(team_b)
+            
+            comp_data = []
+            categories = ["Games_Played", "G", "A", "PPP", "S", "+/-", "Hits", "BkS", "W", "SO"]
+            for cat in categories:
+                a_val = proj_a[cat]
+                b_val = proj_b[cat]
+                winner = team_a if a_val > b_val else team_b if b_val > a_val else "Tie"
+                comp_data.append({
+                    "Category": cat.replace("_", " "),
+                    f"{team_a}": round(a_val, 1),
+                    f"{team_b}": round(b_val, 1),
+                    "Projected Winner": winner
                 })
                 
-        proj_df = pd.DataFrame(proj_data)
-        if not proj_df.empty:
-            proj_df = proj_df.sort_values(by="Total Roster Power", ascending=False).reset_index(drop=True)
-            proj_df.index = proj_df.index + 1
-            
-            assessments = []
-            for rank in proj_df.index:
-                if rank == 1:
-                    assessments.append("🏆 Championship Favorite (Elite Underlying Talent)")
-                elif rank in [2, 3]:
-                    assessments.append("⚔️ Heavyweight Contender (Built for the Playoffs)")
-                elif rank in [4, 5]:
-                    assessments.append("⚖️ Mid-Tier Threat (One trade away from contending)")
-                elif rank in [6, 7]:
-                    assessments.append("⚠️ Paper Tiger / Rebuild Needed (Statistically weak)")
-                else:
-                    assessments.append("🪦 The Basement (Mathematically eliminated by the Oracle)")
-            
-            proj_df.insert(2, "Gazette Model Assessment", assessments)
-            
-            st.markdown("### 📈 Projected End-of-Season Standings (True Talent)")
+            matchup_df = pd.DataFrame(comp_data)
+
+            def highlight_team_a_winner(row):
+                styles = [""] * len(row)
+                if row.get("Projected Winner") == team_a:
+                    styles = ["font-weight: bold; color: #51cf66"] * len(row)
+                return styles
+
+            styled_matchup_df = matchup_df.style.apply(highlight_team_a_winner, axis=1)
+
             st.dataframe(
-                proj_df.style.background_gradient(subset=["Total Roster Power", "Skater Strength", "Goalie Strength"], cmap="viridis")
-                             .format({
-                                 "Total Roster Power": "{:.2f}",
-                                 "Skater Strength": "{:.2f}",
-                                 "Goalie Strength": "{:.2f}"
-                             }),
-                use_container_width=True
+                styled_matchup_df,
+                use_container_width=True,
+                hide_index=True,
             )
-            
             st.markdown("---")
-            st.subheader("🆚 Model vs. Model Breakdown")
+            st.subheader("📋 Optimal Lineup & Start/Sit Advisor")
+            st.markdown("Automatically bench your lowest-rated players on heavy schedule nights based on strict roster limits (2C, 2LW, 2RW, 4D, 2G).")
             
-            top_team = proj_df.iloc[0]
-            bottom_team = proj_df.iloc[-1]
+            opt_team = st.selectbox("Select Team to Optimize", all_teams_in_league, key="lineup_team")
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.success(f"**The Gazette's Chosen Champion:** {top_team['Team']}")
-                st.write(f"**Total Power Score:** {top_team['Total Roster Power']:.2f}")
-                st.write(f"**Led By:** {top_team['Franchise Cornerstones']}")
-                st.caption("This team possesses the highest aggregate multi-category potential in the league.")
+            roster = unified_pool[unified_pool["Fantasy_Team"] == opt_team]
+            
+            if not roster.empty:
+                total_active = 0
+                benched = 0
                 
-            with col2:
-                st.error(f"**The Gazette's Rebuild Candidate:** {bottom_team['Team']}")
-                st.write(f"**Total Power Score:** {bottom_team['Total Roster Power']:.2f}")
-                st.write(f"**Led By:** {bottom_team['Franchise Cornerstones']}")
-                st.caption("Regardless of their current real-life standing, this roster is mathematically hollow.")
+                import datetime
+                curr_d = datetime.datetime.strptime(start_d, "%Y-%m-%d").date()
+                end_date_obj = datetime.datetime.strptime(end_d, "%Y-%m-%d").date()
+                
+                while curr_d <= end_date_obj:
+                    day_str = curr_d.strftime("%Y-%m-%d")
+                    day_label = curr_d.strftime("%A, %b %d")
+                    
+                    teams_playing = set()
+                    try:
+                        resp = requests.get(f"https://api-web.nhle.com/v1/schedule/{day_str}", timeout=5)
+                        if resp.status_code == 200:
+                            for day_data in resp.json().get("gameWeek", []):
+                                if day_data["date"] == day_str:
+                                    for game in day_data.get("games", []):
+                                        teams_playing.add(game.get("awayTeam", {}).get("abbrev", ""))
+                                        teams_playing.add(game.get("homeTeam", {}).get("abbrev", ""))
+                    except: pass
+                    
+                    # Pull all active players for the day, sorted highest rating to lowest
+                    active_players = roster[roster["Team"].isin(teams_playing)].sort_values(by="Overall_Rating", ascending=False)
+                    
+                    if not active_players.empty:
+                        starters = []
+                        bench_list = []
+                        
+                        # Strict roster limits
+                        slot_counts = {"C": 0, "LW": 0, "RW": 0, "D": 0, "G": 0}
+                        max_slots = {"C": 2, "LW": 2, "RW": 2, "D": 4, "G": 2}
+                        
+                        for _, row in active_players.iterrows():
+                            pos_str = str(row["Pos"]).upper().replace("/", ",").replace(" ", "")
+                            assigned = False
+                            assigned_slot = None
+                            
+                            # Check for injury tags
+                            is_injured = any(tag in str(row["Player"]) for tag in ["🚑", "🚨", "🏥", "Out", "IR"])
+                            
+                            if not is_injured:
+                                # Handle Goalies
+                                if row["Position_Type"] == "Goalie" or "G" in pos_str:
+                                    if slot_counts["G"] < max_slots["G"]:
+                                        slot_counts["G"] += 1
+                                        assigned_slot = "G"
+                                        assigned = True
+                                else:
+                                    # Order slots to test: try filling specific single-eligibility positions or open gaps
+                                    # If a player has LW,RW, check both!
+                                    available_positions = [p.strip() for p in pos_str.split(",") if p.strip() in max_slots]
+
+                                    # Prioritize slotting where capacity is lowest / available
+                                    for p in available_positions:
+                                        if slot_counts[p] < max_slots[p]:
+                                            slot_counts[p] += 1
+                                            assigned_slot = p
+                                            assigned = True
+                                            break
+                                            
+                            if assigned:
+                                # Save the player along with the specific slot they are filling
+                                starters.append({
+                                    "Player": row["Player"], 
+                                    "Team": row["Team"], 
+                                    "Slot": assigned_slot
+                                })
+                            else:
+                                bench_list.append(row)
+                        
+                        total_active += len(starters)
+                        benched += len(bench_list)
+                        
+                        with st.expander(f"{day_label} | {len(active_players)} Playing"):
+                            if starters:
+                                st.markdown("##### 🟢 Active Lineup")
+                                # Print starters in exact positional order
+                                pos_order = ["C", "LW", "RW", "D", "G"]
+                                for pos_slot in pos_order:
+                                    players_in_slot = [s for s in starters if s["Slot"] == pos_slot]
+                                    if players_in_slot:
+                                        names = ", ".join([f"{s['Player']} ({s['Team']})" for s in players_in_slot])
+                                        st.markdown(f"**{pos_slot}:** {names}")
+                                        
+                            if bench_list:
+                                st.markdown("##### 🔴 Bench")
+                                st.markdown(", ".join([f"{r['Player']} ({r['Pos']} - {r['Team']})" for r in bench_list]))
+                    
+                    curr_d += datetime.timedelta(days=1)
+                    
+                col_m1, col_m2 = st.columns(2)
+                col_m1.metric("Total Optimal Starts", total_active)
+                col_m2.metric("Stats Lost to Bench", benched)
